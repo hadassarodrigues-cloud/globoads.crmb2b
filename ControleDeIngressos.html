@@ -2,6 +2,7 @@
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8">
+<meta name="robots" content="noindex,nofollow">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Controle de ingressos | Globo</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1389,15 +1390,131 @@ function bind(){
   });
 }
 
+/* ---------- armazenamento: Google Sheets via Apps Script ---------- */
+// Cole aqui a URL do app da web gerada em "Implantar" no Apps Script (termina em /exec)
+const API_URL="https://script.google.com/macros/s/AKfycbyBcIMkWvtn16G8JxBKCxUS2vi3OANJ_evlGgZkekkamGe4LwouBF8n14Aqe-kSpVMTuw/exec";
+const POLL_MS=8000;
+let senhaApi="", entrando=false;
+const lerSenha=()=>{ try{ return localStorage.getItem("ci_senha")||""; }catch(_){ return ""; } };
+const salvarSenha=s=>{ try{ localStorage.setItem("ci_senha",s); }catch(_){} };
+const limparSenha=()=>{ try{ localStorage.removeItem("ci_senha"); }catch(_){} };
+function erroApi(code,msg){ const e=new Error(msg||code); e.code=code; return e; }
+async function chamar(corpo){
+  let r,j;
+  try{ r=await fetch(API_URL,{method:"POST",redirect:"follow",body:JSON.stringify(Object.assign({senha:senhaApi},corpo))}); }
+  catch(_){ throw erroApi("unavailable","rede"); }
+  try{ j=await r.json(); }catch(_){ throw erroApi("unavailable","resposta"); }
+  if(!j||!j.ok){ if(j&&j.erro==="senha") throw erroApi("senha","senha"); throw erroApi("falha",(j&&j.erro)||"erro"); }
+  return j;
+}
+function telaSenha(aviso){
+  return new Promise(res=>{
+    const velho=document.getElementById("ci-login"); if(velho) velho.remove();
+    const ov=document.createElement("div"); ov.id="ci-login";
+    ov.style.cssText="position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;padding:16px";
+    ov.innerHTML='<div role="dialog" aria-modal="true" aria-labelledby="ci-l-t" style="background:var(--surface,#fff);color:var(--ink,#000);border-radius:12px;padding:24px;max-width:360px;width:100%;box-shadow:0 10px 40px rgba(0,0,0,.3);font:inherit">'
+      +'<h2 id="ci-l-t" style="margin:0 0 6px;font-size:1.15rem">Acesso restrito</h2>'
+      +'<p style="margin:0 0 12px;color:var(--muted,#808080);font-size:.9rem">Digite a senha da equipe para abrir o controle de ingressos.</p>'
+      +'<p id="ci-l-e" role="alert" style="margin:0 0 10px;color:var(--bad,#FF0C1F);font-size:.9rem"></p>'
+      +'<input id="ci-l-s" type="password" autocomplete="current-password" aria-label="Senha" style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--line,#D9D9D9);border-radius:8px;font:inherit;margin-bottom:12px">'
+      +'<button id="ci-l-b" type="button" class="primary" style="width:100%;padding:10px 12px;cursor:pointer">Entrar</button></div>';
+    document.body.appendChild(ov);
+    ov.querySelector("#ci-l-e").textContent=aviso||"";
+    const inp=ov.querySelector("#ci-l-s"), go=()=>{ const v=inp.value; if(!v) return; ov.remove(); res(v); };
+    ov.querySelector("#ci-l-b").addEventListener("click",go);
+    inp.addEventListener("keydown",e=>{ if(e.key==="Enter") go(); });
+    inp.focus();
+  });
+}
+let bancoRef=null;
+async function entrar(aviso){
+  if(entrando) return "ok"; entrando=true;
+  try{
+    for(;;){
+      if(!senhaApi) senhaApi=lerSenha();
+      if(!senhaApi){ senhaApi=await telaSenha(aviso); }
+      const st=await bancoRef.atualizar(true);
+      if(st==="senha"){ limparSenha(); senhaApi=""; aviso="Senha incorreta. Tente novamente."; continue; }
+      if(st==="ok") salvarSenha(senhaApi);
+      return st;
+    }
+  } finally { entrando=false; }
+}
+function criarBanco(){
+  const COLS=["eventos","pedidos","publico"];
+  const dados={eventos:new Map(),pedidos:new Map(),publico:new Map()};
+  const ouvintes={eventos:[],pedidos:[],publico:[]};
+  let versao="", carregou=false, ocupado=false, escrevendo=0, escritas=0;
+  const clone=o=>JSON.parse(JSON.stringify(o));
+  const snap=c=>({docs:[...dados[c]].map(([id,d])=>({id,data:()=>clone(d)})),metadata:{fromCache:false}});
+  const avisar=c=>ouvintes[c].forEach(l=>{ try{ l.ok(snap(c)); }catch(e){ console.error(e); } });
+  async function atualizar(forcar){
+    if(ocupado||escrevendo>0) return "ocupado";
+    ocupado=true; const antes=escritas;
+    try{
+      const j=await chamar({acao:"listar",versao:forcar?"":versao});
+      if(antes!==escritas||escrevendo>0){ return "ocupado"; }
+      setNotice("net",null);
+      if(j.mudou!==false){
+        COLS.forEach(c=>{ const m=new Map(); ((j.dados&&j.dados[c])||[]).forEach(x=>m.set(x.id,x.data)); dados[c]=m; });
+        versao=j.versao; carregou=true; COLS.forEach(avisar);
+      } else versao=j.versao;
+      return "ok";
+    }catch(e){
+      if(e.code==="senha"){ if(!entrando) entrar("Sua senha não é mais válida. Digite novamente."); return "senha"; }
+      if(carregou) setNotice("net","Sem conexão com os dados. Tentando novamente…",true);
+      else ouvintes.eventos.concat(ouvintes.pedidos,ouvintes.publico).forEach(l=>l.err&&l.err(e));
+      return "erro";
+    } finally { ocupado=false; }
+  }
+  async function gravar(colecao,id,op,data){
+    escrevendo++;
+    try{
+      const j=await chamar({acao:"gravar",op,colecao,id,data:data===undefined?null:data});
+      if(op==="delete") dados[colecao].delete(id); else dados[colecao].set(id,j.doc);
+      avisar(colecao);
+    }catch(e){
+      if(e.code==="senha"&&!entrando) entrar("Sua senha não é mais válida. Digite novamente.");
+      throw e;
+    } finally {
+      escrevendo--; escritas++;
+      if(escrevendo===0) setTimeout(()=>atualizar(false),400);
+    }
+  }
+  bancoRef={atualizar};
+  setInterval(()=>{ if(!document.hidden&&!entrando) atualizar(false); },POLL_MS);
+  document.addEventListener("visibilitychange",()=>{ if(!document.hidden&&!entrando) atualizar(false); });
+  return {
+    atualizar,
+    collection(nome){
+      return {
+        onSnapshot(ok,err){
+          const l={ok,err}; ouvintes[nome].push(l);
+          if(carregou) { try{ ok(snap(nome)); }catch(e){ console.error(e); } }
+          return ()=>{ ouvintes[nome]=ouvintes[nome].filter(x=>x!==l); };
+        },
+        doc(id){
+          return {
+            set:d=>gravar(nome,id,"set",d),
+            update:d=>gravar(nome,id,"update",d),
+            delete:()=>gravar(nome,id,"delete")
+          };
+        }
+      };
+    }
+  };
+}
+
 /* ---------- inicialização ---------- */
 async function init(){
   route(); bind(); resetEvento(); renderAll();
-  const c=window.claude;
-  if(!c||typeof c.use!=="function"){ setNotice("db","Abra esta página no Claude para salvar e compartilhar os dados.",true); return; }
-  const [dbNs,userNs,dlNs]=await Promise.all([c.use("db"),c.use("user"),c.use("downloads")]);
-  db=dbNs; downloads=dlNs;
-  if(!db){ setNotice("db","Entre na sua conta para ver e registrar eventos, público e pedidos.",true); canWrite=false; renderAll(); return; }
-  if(userNs){ try{ const w=await userNs.can("data.write"); if(w===false) setReadOnly(); else if(w===true) userCanWriteKnown=true; }catch(_){} }
+  if(/COLE_AQUI/.test(API_URL)){ setNotice("db","Falta configurar a URL do Apps Script (API_URL) no início do script desta página.",true); canWrite=false; renderAll(); return; }
+  downloads={ save:async({filename,data})=>{
+    const url=URL.createObjectURL(data); const a=document.createElement("a");
+    a.href=url; a.download=filename; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),4000);
+  } };
+  db=criarBanco();
   setNotice("load","Carregando dados…");
   const timer=setTimeout(()=>{ if(!(loaded.ev&&loaded.pe&&loaded.pb)) setNotice("load","Os dados ainda não chegaram. Verifique a conexão; a página continua tentando e pode estar desatualizada.",true); },10000);
   const done=()=>{ if(loaded.ev&&loaded.pe&&loaded.pb){ clearTimeout(timer); setNotice("load",null); } };
@@ -1418,6 +1535,8 @@ async function init(){
     if(!s.metadata.fromCache){ loaded.pb=true; done(); }
     renderAll();
   },fail);
+  const st=await entrar();
+  if(st==='erro') fail();
 }
 init();
 })();
